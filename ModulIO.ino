@@ -49,7 +49,7 @@ const int MAX_DEVICES = 10;
 Device* devices[MAX_DEVICES];
 int deviceCount = 0;
 
-//Hardware parameters
+// Hardware parameters
 const int reservedPins[] = {0, 1}; // Tx and Rx
 const int resPinSize = 2; // Number of reserved pins
 const int highestPin = 13;
@@ -302,9 +302,10 @@ void loop() {
 
                 case 't': // Toggle data output
                     sensorSpam = !sensorSpam;
-                    if (arrlen != 1) { // if period is specified
-                        sensorPeriod = cmdarr[1].toInt();
-                    }
+                    break;
+                
+                case 'u': // Update data output period
+                    changeSensorPeriod(cmdarr[1].toInt());
                     break;
 
                 case 'v': // View devices
@@ -457,6 +458,16 @@ void sendData() {
     Serial.println(out + ";"); // semi-colon to indicate end of data
 }
 
+void changeSensorPeriod(int newPeriod) {
+    // Changes the period of sensor data output.
+    if (newPeriod < 1) {
+        Serial.println(F("Errr: Period must be at least 1 ms."));
+    } else {
+        sensorPeriod = newPeriod;
+        Serial.println("Conf: Sensor data output period changed to " + String(sensorPeriod) + " ms.");
+    }
+}
+
 void help() {
     // For user guidance.
     Serial.println(F("====AVAILABLE FUNCTIONS===="));
@@ -467,7 +478,8 @@ void help() {
     Serial.println(F("\tm - DC motor (s m [name] [pin])"));
     Serial.println(F("\tp - Pressure sensor (s p [name] [data pin] [clock pin])"));
     Serial.println(F("t - Toggle serial data output spam (t [period])"));
-    Serial.println(F("\t(Period is optional. Default is 100ms)"));
+    Serial.println(F("u - Change data output period (u [period])"));
+    Serial.println(F("\t   ("Default: 100 ms, no lower than 1 accepted)"));
     Serial.println(F("v - View devices & their indexes"));
     Serial.println(F("r - Remove device (r [index])"));
     Serial.println(F("c - Control device (c [index] [new value])"));
