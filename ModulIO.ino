@@ -43,9 +43,12 @@ struct Device {
     } 
 };
 
+// Serial communication parameters
+#define SERIAL_BAUD_RATE 115200 // Serial baud rate
+#define SERIAL_TIMEOUT 100 // Serial read timeout in ms
 
 // Device setup parameters
-const int MAX_DEVICES = 10;
+#define MAX_DEVICES 10
 Device* devices[MAX_DEVICES];
 int deviceCount = 0;
 
@@ -55,7 +58,7 @@ const int resPinSize = 2; // Number of reserved pins
 const int highestPin = 13;
 
 // Command parsing parameters
-const int MAX_ARGS = 10; // Max command length (ex. "s p p1 12 13" would be 5 args)
+#define MAX_ARGS 10 // Max command length (ex. "s p p1 12 13" would be 5 args)
 String cmdarr[MAX_ARGS];
 
 // Sensor loop parameters
@@ -257,8 +260,9 @@ struct DCMotorDevice : public Device {
 
 void setup() {
     // Begin serial comms.
-    Serial.begin(115200);
-    Serial.setTimeout(10);
+    Serial.begin(SERIAL_BAUD_RATE); // EEEEE
+    Serial.setTimeout(SERIAL_TIMEOUT); // EEEEE
+    Serial.println(F("ModulIO v0.3 - Modular GPIO controller ready. Enter 'h' for help."));
 }
 
 void loop() {
@@ -288,7 +292,7 @@ void loop() {
                     controlDevice(cmdarr[1].toInt(), cmdarr[2]);
                     break;
 
-                case 'h': // Help - list commands
+                case 'h': // Info/Help - list commands
                     help();
                     break;
                 
@@ -479,7 +483,7 @@ void help() {
     Serial.println(F("\tp - Pressure sensor (s p [name] [data pin] [clock pin])"));
     Serial.println(F("t - Toggle serial data output spam (t [period])"));
     Serial.println(F("u - Change data output period (u [period])"));
-    Serial.println(F("\t   ("Default: 100 ms, no lower than 1 accepted)"));
+    Serial.println(F("\t   (Default: 100 ms, no lower than 1 accepted)"));
     Serial.println(F("v - View devices & their indexes"));
     Serial.println(F("r - Remove device (r [index])"));
     Serial.println(F("c - Control device (c [index] [new value])"));
