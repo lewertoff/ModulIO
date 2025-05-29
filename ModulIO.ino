@@ -1,12 +1,22 @@
 /* 
-  ================================================
+  ==================================================================================================
   ModulIO - Modular GPIO controller
-  Version 0.02 May 22
+  Version 0.4.1 May 29 2025
   Description: Runtime creation & control of I/O devices via serial commands
-  ================================================
+  ==================================================================================================
+
+    This file, designed for an Arduino Uno R3, contains several functions accessible through a basic 
+    command system via serial connection. 
+    Its main purpose is to simplify GPIO device interactions into an overreaching class such that all
+    device interactions can be generalized for easy management. Through serial interactions, devices
+    can be controlled manually, or automated by the ModulIO Python library. 
+
+    See README for information on how to add your own customizable devices.
+
+  ==================================================================================================
 */
 
-////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+////////////////////////////////////////////////////////////////////////////////////////////////////
 // SETUP
 
 #include "HX711.h"
@@ -61,12 +71,12 @@ const int highestPin = 13;
 #define MAX_ARGS 10 // Max command length (ex. "s p p1 12 13" would be 5 args)
 String cmdarr[MAX_ARGS];
 
-// Sensor loop parameters
+// Data stream parameters
 bool sensorSpam = false; // Controls continuous sensor data output via serial
 unsigned long msLastExecution = 0; // millis
-unsigned long sensorPeriod = 100; // ms waited before next loop
+unsigned long sensorPeriod = 5000; // ms waited before next loop
 
-////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+////////////////////////////////////////////////////////////////////////////////////////////////////
 // HELPER FUNCTIONS
 
 bool isInArray(int value, const int* arr, int size) {
@@ -78,7 +88,7 @@ bool isInArray(int value, const int* arr, int size) {
     return false;
 }
 
-////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+////////////////////////////////////////////////////////////////////////////////////////////////////
 // DEVICE STRUCTS
 
 struct ButtonDevice : public Device {
@@ -255,14 +265,14 @@ struct DCMotorDevice : public Device {
     }
 };
 
-////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+////////////////////////////////////////////////////////////////////////////////////////////////////
 // MAIN SCRIPT
 
 void setup() {
     // Begin serial comms.
     Serial.begin(SERIAL_BAUD_RATE); // EEEEE
     Serial.setTimeout(SERIAL_TIMEOUT); // EEEEE
-    Serial.println(F("ModulIO v0.3 - Modular GPIO controller ready. Enter 'h' for help."));
+    Serial.println(F("ModulIO v0.4.1 - Modular GPIO controller ready. Enter 'h' for help."));
 }
 
 void loop() {
@@ -304,8 +314,8 @@ void loop() {
                     setupWiz(cmdarr);
                     break;
 
-                case 't': // Toggle data output
-                    sensorSpam = !sensorSpam;
+                case 't': // Change data output
+                    sensorSpam = bool(cmdarr[1].toInt());
                     break;
                 
                 case 'u': // Update data output period
@@ -481,7 +491,7 @@ void help() {
     Serial.println(F("\tl - LED (s l [name] [pin]) - positive pin"));
     Serial.println(F("\tm - DC motor (s m [name] [pin])"));
     Serial.println(F("\tp - Pressure sensor (s p [name] [data pin] [clock pin])"));
-    Serial.println(F("t - Toggle serial data output spam (t [period])"));
+    Serial.println(F("t - Enable or disable serial data stream (t [0 or 1])"));
     Serial.println(F("u - Change data output period (u [period])"));
     Serial.println(F("\t   (Default: 100 ms, no lower than 1 accepted)"));
     Serial.println(F("v - View devices & their indexes"));

@@ -1,30 +1,43 @@
-# ModulIO
-# A Python/Arduino program for managing devices over a serial connection.
-# 
-# This file includes callable functions to connect & disconnect serial, create & remove 
-# devices, toggle data stream, and record data stream to a CSV.
-# Device instances can also be read and written to, allowing for interaction with the devices.
-#
+"""
+  ==================================================================================================
+  ModulIO - A Python/Arduino program for managing devices over a serial connection.
+  Version 0.4.1 May 29 2025
+  Description: Simplified universal control of GPIO devices through an Arduino host.
+  ==================================================================================================
 
-###################################################################################################
+    This file includes callable functions to connect & disconnect serial, create & remove devices, 
+    toggle data stream, and record data stream to a CSV.
+    Device instances can also be read and written to, allowing for interaction with the devices.
+
+    See README for information on how to add your own customizable devices.
+
+  ==================================================================================================
+"""
+####################################################################################################
 # SETUP
 
-import serial
-import threading
-from datetime import datetime
 import time
+from datetime import datetime
+import threading
+import serial
 import csv
 import logging
 
 class Device:
-    def __init__ (self, char, name, pins):
-        """
-        Initializes a device with the given name and pins.
-        @param char: Character representing the device type (e.g., 'b' for button, 'p' for pressure sensor).
-        @param name: Name of the device.
-        @param pins: List of pins associated with the device. For example, a button might have one pin, while a pressure sensor might have two (data and clock).
-        @raises Exception: If the device fails to initialize or confirm.
-        @note: This function sends a command to the Arduino to initialize the device and waits for confirmation.
+    def __init__ (self, char: str, name: str, pins: list[int]):
+        """Initializes a device with the given name and pins.
+
+        Args:
+            char (str): Sinle character representing device type (e.g., 'b' for button, 'p' for
+                pressure sensor).
+            name (str): Name of the device. Must be uniqe against all other devices.
+            pins (list[int]): List of pins associated with the device.
+
+        Raises:
+            RuntimeError: If Arduino errors or does not confirm creation.
+
+        Notes:
+            This function sends a command to the Arduino to initialize the device and waits for confirmation.
         """
         global names_in_order
 
@@ -35,18 +48,19 @@ class Device:
         self.index = None
         self.name = None
         self.pin = None
+        self.lock = threading.Lock() # For data integrity
         
         try:
             # Convert list of pins into string separating pins with spaces
             pin_str = " ".join(map(str, pins)) if isinstance(pins, list) else str(pins)
 
-            safe_write(f"s {char} {name} {pin_str}")
+            _safe_write(f"s {char} {name} {pin_str}")
 
             # error check before confirming device
             confirmed = conf_event.wait(timeout=2)
             errored = errr_event.is_set()
             if not confirmed or errored:
-                raise Exception(f"Arduino did not confirm device {name} creation.")
+                raise RuntimeError(f"Device unconfirmed or errored.")
 
             self.name = name
             self.pin = pin_str
@@ -60,62 +74,85 @@ class Device:
             logging.error(f"Failed to initialize device {name}: {e}")
             raise
 
-    def read(self):
+    def get_value(self):
+        """Gets sensed or actuated value.
+        
+        Returns:
+            str: Sensors return their sensed value, while actuators return their current
+                state.
         """
-        Callable function to read the value of the device (both sensors & actuators).
-        @return: Sensors return their sensed value, while actuators return their current state.
-        """
-        return self.value
+        with self.lock:
+            return self.value
     
-    def write(self, value: str | int):
-        """
-        Callable function to change the value of a device, if it is an actuator.
-        @param value: The value to set the device to. For example, a motor or LED accepts a PWM value (0-255).
-        """
-        safe_write(f"c {self.index} {value}")
+    def set_value(self, value: str | int):
+        """Tells Arduino to change device's value. Sensors do not need this function.
 
-    def update(self, value):
+        Args:
+            value (str | int): The value to set the device to. For example, a motor or LED 
+            accepts a PWM value (0-255).
+
+        Notes:
+            This function does NOT change the self.value property. This property is only changed 
+            once the data stream coming back from the Arduino confirms the new status. It is 
+            updated via a call to the internal self._update function.
         """
-        Internal function to update the device with its latest value.
-        @param value: The new value to update the device with. 
-        @note: This function is typically called by the receive_data thread.
-        """
-        self.value = value
+        _safe_write(f"c {self.index} {value}")
 
     def get_index(self):
-        """
-        Internal function to get the index of the device.
-        @return: The index of the device in the Arduino's devices array.
-        @note: This index is used to identify the device in serial communication.
-        """
-        return self.index
+        """Gets the index of the device in the Arduino's devices array.
 
-    def set_index(self, new_idx):
-        """
-        Internal function to change the index of the device. 
-        @note: Used to keep indexes across Python & Arduino matching after removing a device.
-        """
-        self.index = new_idx
+        Returns:
+            int: The index of the device in the Arduino's devices array.
 
+        Notes:
+            This index is used to identify the device in serial communication.
+        """
+        with self.lock:
+            return self.index
+
+    def _update(self, value: str):
+        """Sets the self.value property of the device.
+
+        Args:
+            value (str): The new value to update the device with. 
+        
+        Notes:
+            This function is typically called by the receive_data thread.
+        """
+        with self.lock:
+            self.value = value
+
+    def _set_index(self, new_idx: int):
+        """Changes the index of the device. 
+
+        Args:
+            new_idx (int): The new desired index for the device.
+
+        Notes:
+            DOES NOT NEED TO BE TOUCHED EXTERNALLY! Python<-->Arduino communication uses indexes 
+            to distinguish devices while the ModulIO Python library converts them to objects 
+            identified by names. This function is used to keep indexes across Python & Arduino 
+            matching after removing a device.
+        """
+        with self.lock:
+            self.index = new_idx
 
 # Serial setup
-SERIAL_PORT = "COM5" # Serial port to connect to (change as needed)
-SERIAL_BAUD_RATE = 115200 # Baud rate for serial communication
-SERIAL_TIMEOUT = 100 # Timeout for serial communication in seconds
+BOOTUP_DELAY = 2 # How long it takes for the microcontroller to begin loop() calls
+SERIAL_BAUD_RATE = 115200 # Baud rate for serial communication. Must match Arduino setting!
+SERIAL_TIMEOUT = 100 # Timeout for serial communication in ms. Must match Arduino setting!
 ser = None # Connection instance
-data_stream_active = False # Data stream (serial spam) status
+
+IDLE_WAIT_DELAY = 0.002 # Short delay to avoid busy waiting
+DEFAULT_DATA_STREAM_PERIOD = 5000 # ms
 
 # Device setup
+MAX_DEVICES = 10  # Maximum devices that can be created
 device_dict = {} # Names to device instances
 names_in_order = [] # Names in order of indexes
-MAX_DEVICES = 10  # Maximum devices that can be created
-
-# Recording setup
-recording = False # Flag for recording data to CSV
-new_data_to_record = False # Flag for new data to record in CSV
 
 # Threading setup
-thread_receive_data = None # Thread for receiving data from Arduino
+thread_receive_serial = None # Thread for receiving data from Arduino
 stop_receive_event = threading.Event() # Tells receive data thread to stop
 thread_record_data = None # Thread for recording data to CSV
 stop_record_event = threading.Event() # Tells record data thread to stop
@@ -123,12 +160,16 @@ conf_event = threading.Event() # Signifies general action confirmed
 errr_event = threading.Event() # Signifies general error
 serial_lock = threading.Lock() # For thread-safe serial communication
 
+# Recording setup
+recording = False # Status flag for recording data to CSV
+new_data_to_record = threading.Event() # Alerts recording threat of new data
+
 # Logging setup
 logging.basicConfig(level=logging.DEBUG, format="%(asctime)s [%(levelname)s] - %(message)s", 
                     handlers=[logging.FileHandler("modulio.log")])
 
-###################################################################################################  
-# DEVICE CLASSES
+####################################################################################################  
+# CUSTOM DEVICE CLASSES
 
 class ButtonDevice(Device):
     def __init__ (self, name, pin):
@@ -146,75 +187,78 @@ class DCMotorDevice(Device):
     def __init__ (self, name, pin):
         super().__init__("m", name, pin)
 
-###################################################################################################
+####################################################################################################
 # CALLABLE FUNCTIONS
 
-def connect() -> None:
+def connect(port: str) -> None:
+    """Initializes serial connection, then starts data stream and reception.
+    
+    Args:
+        port (str): The serial port to connect to (e.g., "COM5").
     """
-    Connects to the specified SERIAL_PORT.
-    """
-
     global ser
 
-    # Make sure a port is specified
-    if not SERIAL_PORT:
-        logging.critical("SERIAL_PORT is not set")
-        raise Exception("SERIAL_PORT is not set. Please set it to a valid port.")
-    
     try:
-        ser = serial.Serial(SERIAL_PORT, SERIAL_BAUD_RATE, timeout=SERIAL_TIMEOUT)
-        logging.info(f"Connected to {SERIAL_PORT}.")
+        ser = serial.Serial(port, SERIAL_BAUD_RATE, timeout=SERIAL_TIMEOUT)
+        logging.info(f"Connected to {port}.")
         
-        time.sleep(2) # IMPORTANT! Wait for Arduino to reboot (it automatically resets when serial port is opened)
-
+        time.sleep(BOOTUP_DELAY) # IMPORTANT! Wait for Arduino to reboot (it automatically resets when serial port is opened)
+        
         ser.reset_input_buffer() # Empty input buffer to avoid reading startup junk
-        start_receive_thread() # Start thread to read messages from Arduino
+
+        _start_receive_thread() # Start thread to read messages from Arduino
+
+        _enable_data_stream() # Tell Arduino to start sending data
 
     except Exception as e:
-        logging.error(f"Error connecting to {SERIAL_PORT}: {e}")
+        logging.error(f"Error connecting to {port}: {e}")
         raise
 
 def disconnect() -> None:
-    """
-    Disconnects from the currently connected serial port.
-    If recording is active, it will stop recording.
-    """
+    """Removes all devices and disconnects from the currently connected serial port.
 
+    Notes:
+    Call this before terminating main program.
+    If recording is active, calling disconnect() will stop recording.
+    """
     global ser
 
+    # Remove all devices
+    for name in names_in_order[:]:  # Copy the list to avoid modifying it while iterating
+        device_dict[name].set_value(0)  # Turn off all devices before removing
+        remove_device(name)
+
+    # Set data stream back to default
+    change_data_stream_period(DEFAULT_DATA_STREAM_PERIOD)
+
     # Stop all running threads
-    stop_record_thread()
+    _stop_record_thread()
     time.sleep(0.1) # Give some time for the thread to stop
-    stop_receive_thread()
+    _stop_receive_thread()
+
+    _disable_data_stream() # Tell Arduino to stop sending data
 
     if ser and ser.is_open:
         ser.close()
         logging.info("Serial disconnected.")
 
     else:
-        logging.warning("Serial port is not open or already closed.")
+        logging.warning("Disconnect called when serial port is not open or already closed.")
     
     ser = None  # Reset the serial connection
 
-def safe_write(msg: str) -> None:
-    """
-    Internal Thread-safe function to write to the serial port.
-    @param msg: The message to send to the Arduino.
-    """
-
-    if ser and ser.is_open:
-        with serial_lock:
-            ser.write(f"{msg}\n\r".encode('ascii'))
-            ser.flush()  # Ensure the message is sent immediately
-        logging.info(f"Python -> Sent: {msg}")
-
 def create_device(device_char: str, name: str, pins: list[int]) -> Device | None:
-    """
-    Creates a device of the specified type and adds it to the device dictionary.
-    @param device_char: Character representing the device type (e.g., 'b' for button, 'p' for pressure sensor).
-    @param name: Name of the device.
-    @param pins: List of pins associated with the device. For example, a button might have one pin, while a pressure sensor might have two (data and clock).
-    @return: The created device instance, or None if the device could not be created.
+    """Creates a device of the specified type and adds it to the device dictionary.
+    
+    Args:
+        char (str): Sinle character representing device type (e.g., 'b' for button, 'p' for
+            pressure sensor).
+        name (str): Name of the device. Must be uniqe against all other devices.
+        pins (list[int]): List of pins associated with the device.
+
+    Returns:
+        Device: A new Device instance of the appropriate subclass.
+        None: if an error occurred during creation.
     """
     global device_dict
 
@@ -258,17 +302,24 @@ def create_device(device_char: str, name: str, pins: list[int]) -> Device | None
         logging.warning(f"Failed to add {type_map.get(device_char)} '{name}'.")
 
 def remove_device(name: str) -> None:
-    """
-    Deletes a device from the available devices. Removes it from both Arduino and Python.
-    @param name: Name of the device to remove.
-    """
+    """Deletes a device from the available devices.
 
+    Args:
+        name (str): Name of the device to remove.
+
+    Raises:
+        RuntimeError: If recording, or if device removal failed.
+        ValueError: If device name is not found.
+
+    Notes:
+        Devices are removed from both Arduino and Python to keep parity.
+    """
     global device_dict, names_in_order
 
     # Recording check
     if recording:
         logging.warning("Cannot delete a device while recording.")
-        raise Exception("Cannot detete a device while recording. Please stop recording first.")
+        raise RuntimeError("Cannot detete a device while recording. Please stop recording first.")
 
     if name in device_dict:
         conf_event.clear()
@@ -278,13 +329,13 @@ def remove_device(name: str) -> None:
 
         try:
             # Delete device from Arduino
-            safe_write(f"r {idx}")
+            _safe_write(f"r {idx}")
 
             # Error check to see if it was actually deleted
             confirmed = conf_event.wait(timeout=2)
             errored = errr_event.is_set()
             if not confirmed or errored:
-                raise Exception(f"Failed to remove device {name}.")
+                raise RuntimeError(f"Failed to remove device {name}.")
             
             # Delete device from Python
             del device_dict[name]
@@ -295,7 +346,7 @@ def remove_device(name: str) -> None:
 
             # Update the index of all devices after the removed one
             for i in range(idx, len(names_in_order)):
-                device_dict[names_in_order[i]].set_index(i)
+                device_dict[names_in_order[i]]._set_index(i)
             
         except Exception as e:
             logging.error(f"Error while removing device '{name}': {e}")
@@ -303,39 +354,86 @@ def remove_device(name: str) -> None:
 
     else:
         logging.warning(f"Device '{name}' not found.")
-        raise Exception(f"Cannot remove device. '{name}' not found.")
+        raise ValueError(f"Cannot remove device. '{name}' not found.")
 
-def toggle_data_stream() -> None:
-    """
-    Toggles data stream on/off. 
-    """
-
-    global data_stream_active
-
-    safe_write("t")
-    logging.info(f"Data stream {'activated' if not data_stream_active else 'deactivated'}.")
-    data_stream_active = not data_stream_active
-
-def change_data_stream_delay(delay: int) -> None:
-    """
-    Changes the delay between data stream updates.
-    Delay is in milliseconds.
-    Default is 100ms.
-    """
+def change_data_stream_period(delay: int) -> None:
+    """Changes the delay between data stream updates.
     
+    Args:
+        delay (int): Milliseconds in between each data stream update.
+    
+    Notes:
+        Arduino's default is 5000ms to not overload I/O. It is advised to set your own value.
+    """
     if not isinstance(delay, int) or delay < 1:
         logging.error("Tried to set an invalid data stream delay.")
         raise Exception("Delay must be an integer above 0.")
     
-    safe_write(f"u {delay}")
+    _safe_write(f"u {delay}")
     logging.info(f"Data stream delay set to {delay} ms.")
 
-def update_data(datalist: list) -> None:
-    """
-    Internal function to update the device_dict with new status/sensor data.
-    @param datalist: List of device-value pairs received from the Arduino.
-    """
+def start_recording(filename:str) -> None:
+    """Starts recording data to a CSV file.
+    
+    Args:
+        filename: Name of the CSV file to record data to.
 
+    Notes:    
+        Data stream must be active to record data.
+        If file already exists, it will be overwritten.
+    """
+    # Serial connection check
+    if not ser or not ser.is_open:
+        logging.error("Cannot start recording: serial port is not open. ")
+        raise Exception("Cannot start recording: serial port is not open. Use connect() first.")
+    
+    _start_record_thread(filename)
+
+def stop_recording() -> None:
+    """Stops recording data to a CSV file.
+    """
+    _stop_record_thread()
+
+def _safe_write(msg: str) -> None:
+    """Safely transmits string through serial.
+
+    Args:
+        msg (str): String to transmit.
+
+    Notes:
+        Thread-safe. Use for all transmissions.
+    """
+    if ser and ser.is_open:
+        with serial_lock:
+            ser.write(f"{msg}\n\r".encode('ascii'))
+            ser.flush()  # Ensure the message is sent immediately
+        logging.info(f"Python -> Sent: {msg}")
+
+def _enable_data_stream() -> None:
+    """Enable data stream from Arduino.
+    """
+    global data_stream_active
+
+    _safe_write("t 1")
+    logging.info("Data stream activated")
+    
+def _disable_data_stream() -> None:
+    """Disables data stream from Arduino. 
+    """
+    global data_stream_active
+
+    _safe_write("t 0")
+    logging.info("Data stream deactivated'")
+
+def _update_data(datalist: list) -> None:
+    """Updates values of all connected devices with new readings.
+
+    Args:
+        datalist (list): List of new data organized as [name:str, value, name2:str, value2, ...]
+
+    Notes:
+        If data integrity is not guaranteed, data is discarded and values are not updated.
+    """
     global new_data_to_record
     
     # Ensure device-value pairs are complete
@@ -346,7 +444,7 @@ def update_data(datalist: list) -> None:
             value = datalist.pop(0) # Pop first index again, which is now its value
         
             if key in device_dict:
-                device_dict[key].update(value)
+                device_dict[key]._update(value)
             else:
                 logging.warning(f"{key} not found in device_dict")
         
@@ -358,108 +456,88 @@ def update_data(datalist: list) -> None:
         logging.warning("Received data list is not complete or does not match device count.")
         # Silently continue, as this can happen if the Arduino sends incomplete data.
 
-def start_recording(filename:str) -> None:
-    """ 
-    Starts recording data to a CSV file.
-    @param filename: Name of the CSV file to record data to.
-    Data stream must be active to record data.
-    """
-
-    if not data_stream_active:
-        logging.error("Cannot start recording: data stream is not active.")
-        raise Exception("Cannot start recording: data stream is not active. Toggle data stream first.")
-    
-    # Serial connection check
-    if not ser or not ser.is_open:
-        logging.error("Cannot start recording: serial port is not open. ")
-        raise Exception("Cannot start recording: serial port is not open. Use connect() first.")
-    
-    start_record_thread(filename)
-
-def stop_recording() -> None:
-    """
-    Stops recording data to a CSV file.
-    """
-    stop_record_thread()
-
-###################################################################################################
+####################################################################################################
 # THREADING
 
-def receive_data() -> None:
-    # Threaded function to receive data from the Arduino.
-    # Calls appropriate actions based on received data.
-
+def _receive_serial() -> None:
+    """Handles incoming data from Arduino & calls required actions.
+    """
     logging.info("Python can now receive data from Arduino")
 
     while not stop_receive_event.is_set():
 
-        if ser and ser.is_open and ser.in_waiting > 0:
+        if ser and ser.is_open:
+            if ser.in_waiting > 0:
 
-            try:
-                data = ser.readline().decode('ascii').strip()
-                if data:
-                    match data[0:5]:
-                        case "Conf:":
-                            logging.info("Arduino -> " + data)
-                            conf_event.set()
+                try:
+                    data = ser.readline().decode('ascii').strip()
+                    if data:
+                        match data[0:5]:
+                            case "Conf:":
+                                logging.info("Arduino -> " + data)
+                                conf_event.set()
 
-                        case "Data:":
-                            logging.debug("Arduino -> "+ data) # set under debug flag since this is spammy
-                            # Check for complete data
-                            assert data.endswith(";"), "Incomplete data (missing semicolon)"
-                            # Pass data to device instances
-                            update_data(data[6:-1].split())
+                            case "Data:":
+                                logging.debug("Arduino -> "+ data) # set under debug flag since this is spammy
+                                # Check for complete data
+                                assert data.endswith(";"), "Incomplete data (missing semicolon)"
+                                # Pass data to device instances
+                                _update_data(data[6:-1].split())
 
-                        case "Errr:":
-                            logging.warning("Arduino -> " + data) # only warn since usually handled by Python
-                            errr_event.set()
+                            case "Errr:":
+                                logging.warning("Arduino -> " + data) # only warn since usually handled by Python
+                                errr_event.set()
 
-                        case "Recv:":
-                            logging.info("Arduino -> " + data) # For logging/debugging purposes only
+                            case "Recv:":
+                                logging.info("Arduino -> " + data) # For logging/debugging purposes only
 
-                        case _:
-                            logging.error("Received data not matched: " + data)
+                            case _:
+                                logging.error("Received data not matched: " + data)
 
-            except Exception as e:
-                logging.error(f"Error while receiving data: {e}")
+                except Exception as e:
+                    logging.error(f"Error while receiving data: {e}")
+        else:
+            time.sleep(IDLE_WAIT_DELAY)  # Sleep for a short time to avoid busy waiting
 
-        time.sleep(0.002)  # Sleep for a short time to avoid busy waiting
-
-def start_receive_thread():
-    # Internal function to start a thread to receive data from the Arduino.
-
-    global thread_receive_data
+def _start_receive_thread():
+    """Starts a _receive_data thread.
+    """
+    global thread_receive_serial
 
     # Check if called when thread already exists
-    if thread_receive_data and thread_receive_data.is_alive():
+    if thread_receive_serial and thread_receive_serial.is_alive():
         logging.info("Stopping existing receive thread before starting a new one.")
-        stop_receive_thread() # Delete thread so it can be created again
+        _stop_receive_thread() # Delete thread so it can be created again
 
     stop_receive_event.clear()
 
-    thread_receive_data = threading.Thread(target=receive_data, daemon=True)
-    thread_receive_data.start()
+    thread_receive_serial = threading.Thread(target=_receive_serial, daemon=True)
+    thread_receive_serial.start()
 
-def stop_receive_thread():
-    # Internal function to stop the thread that receives data from the Arduino.
-
-    global thread_receive_data
+def _stop_receive_thread():
+    """Stops current _receive_data thread if running.
+    """
+    global thread_receive_serial
 
     stop_receive_event.set()
 
-    if thread_receive_data and thread_receive_data.is_alive():
-        thread_receive_data.join(timeout=1)  # give it a second to clean up
+    if thread_receive_serial and thread_receive_serial.is_alive():
+        thread_receive_serial.join(timeout=1)  # give it a second to clean up
         logging.info("Receive thread stopped.")
     else:
         logging.info("Receive thread was not running or already stopped.")
-    thread_receive_data = None
+    thread_receive_serial = None
 
-def record_data_to_csv(filename: str) -> None:
-    # Threaded function to record device data stream to a CSV file.
-    # While recording is active, the following is disabled:
-    # - Creating or removing devices
-    # - Turning off data stream
+def _record_data_to_csv(filename: str) -> None:
+    """Records data stream to a timestamped CSV.
 
+    Args:
+        filename (str):Desired name of file to record to (e.g. "data.csv")
+
+    Notes:
+        If a file of the same name already exists, it will be overwritten.
+        While recording is enabled, new devices cannot be created.
+    """
     global new_data_to_record
 
     with open(filename, mode='w', newline='') as csvfile:
@@ -477,19 +555,18 @@ def record_data_to_csv(filename: str) -> None:
                 if new_data_to_record:
                     row_list = [datetime.now().strftime("%H:%M:%S.%f")[:-3]]
                     for name in names_in_order:
-                        row_list.append(device_dict[name].read())
+                        row_list.append(device_dict[name].get_value())
                     writer.writerow(row_list)
                     new_data_to_record = False  # Reset the flag after writing
                 else:
-                    time.sleep(0.002) # Sleep for a short time to avoid busy waiting
+                    time.sleep(IDLE_WAIT_DELAY) # Sleep for a short time to avoid busy waiting
         
         except Exception as e:
             logging.error(f"Error while recording data: {e}")
-            raise
 
-def start_record_thread(filename: str):
-    # Internal function to start a thread to record data to a CSV file.
-
+def _start_record_thread(filename: str):
+    """Starts a _record_data_to_csv thread and updates recording flag.
+    """
     global thread_record_data, recording
 
     # Check if called when thread already exists
@@ -500,12 +577,14 @@ def start_record_thread(filename: str):
     # Clear the stop event to ensure the thread can start
     stop_record_event.clear()
 
-    thread_record_data = threading.Thread(target=record_data_to_csv, args=(filename,), daemon=True)
+    thread_record_data = threading.Thread(target=_record_data_to_csv, args=(filename,), daemon=True)
     thread_record_data.start()
 
     recording = True
 
-def stop_record_thread():  
+def _stop_record_thread():
+    """ Stops current _record_data_to_csv thread if running.
+    """  
     # Internal function to stop the thread that records data to a CSV file.
 
     global recording, thread_record_data
@@ -520,5 +599,3 @@ def stop_record_thread():
     else:
         logging.info("Recording thread was not running or already stopped.")
     thread_record_data = None
-
-    
