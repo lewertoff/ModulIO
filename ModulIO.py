@@ -1,7 +1,7 @@
 """
   ==================================================================================================
   ModulIO - A Python/Arduino program for managing devices over a serial connection.
-  Version 0.4 May 29 2025
+  Version 0.4.1 May 29 2025
   Description: Simplified universal control of GPIO devices through an Arduino host.
   ==================================================================================================
 
@@ -222,7 +222,7 @@ def disconnect() -> None:
 
     # Remove all devices
     for device in names_in_order[:]:  # Copy the list to avoid modifying it while iterating
-        device_dict[device].write(0)  # Turn off all devices before removing
+        device_dict[device].set_value(0)  # Turn off all devices before removing
         remove_device(device)
 
     # Stop all running threads
@@ -340,7 +340,7 @@ def remove_device(name: str) -> None:
 
             # Update the index of all devices after the removed one
             for i in range(idx, len(names_in_order)):
-                device_dict[names_in_order[i]].set_index(i)
+                device_dict[names_in_order[i]]._set_index(i)
             
         except Exception as e:
             logging.error(f"Error while removing device '{name}': {e}")
@@ -350,7 +350,7 @@ def remove_device(name: str) -> None:
         logging.warning(f"Device '{name}' not found.")
         raise ValueError(f"Cannot remove device. '{name}' not found.")
 
-def change_data_stream_delay(delay: int) -> None:
+def change_data_stream_period(delay: int) -> None:
     """Changes the delay between data stream updates.
     
     Args:
@@ -549,7 +549,7 @@ def _record_data_to_csv(filename: str) -> None:
                 if new_data_to_record:
                     row_list = [datetime.now().strftime("%H:%M:%S.%f")[:-3]]
                     for name in names_in_order:
-                        row_list.append(device_dict[name].read())
+                        row_list.append(device_dict[name].get_value())
                     writer.writerow(row_list)
                     new_data_to_record = False  # Reset the flag after writing
                 else:

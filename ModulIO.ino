@@ -1,7 +1,7 @@
 /* 
   ==================================================================================================
   ModulIO - Modular GPIO controller
-  Version 0.4 May 29 2025
+  Version 0.4.1 May 29 2025
   Description: Runtime creation & control of I/O devices via serial commands
   ==================================================================================================
 
@@ -272,7 +272,7 @@ void setup() {
     // Begin serial comms.
     Serial.begin(SERIAL_BAUD_RATE); // EEEEE
     Serial.setTimeout(SERIAL_TIMEOUT); // EEEEE
-    Serial.println(F("ModulIO v0.4 - Modular GPIO controller ready. Enter 'h' for help."));
+    Serial.println(F("ModulIO v0.4.1 - Modular GPIO controller ready. Enter 'h' for help."));
 }
 
 void loop() {
@@ -315,7 +315,7 @@ void loop() {
                     break;
 
                 case 't': // Change data output
-                    sensorSpam = bool(cmdarr[1]);
+                    sensorSpam = bool(cmdarr[1].toInt());
                     break;
                 
                 case 'u': // Update data output period

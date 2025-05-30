@@ -3,6 +3,12 @@
 - Unit testing
 - Look into recording data with Queue instead of bool flag
 - Rework terminologies & documentation of .ino file - ex: sensor loop / serial spam / data stream inconsistency
+- queue sending for serial controls in case a spam of controls freaks it out. queue the serial output to make this  more time resistant. when there's an overload, itll queue out
+- Whenever program raises error, make sure to disconnect all devices
+
+## v0.4.1 Hotfix - 2025/05/29 10:40 PM
+- Renamed change_data_stream_delay function to change_data_stream_period
+- Fix several communication issues due to renamed functions
 
 ## v0.4 - 2025/05/29 2:27 AM
 - Tweaked license
