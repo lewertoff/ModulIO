@@ -71,7 +71,7 @@ const int highestPin = 13;
 #define MAX_ARGS 10 // Max command length (ex. "s p p1 12 13" would be 5 args)
 String cmdarr[MAX_ARGS];
 
-// Sensor loop parameters
+// Data stream parameters
 bool sensorSpam = false; // Controls continuous sensor data output via serial
 unsigned long msLastExecution = 0; // millis
 unsigned long sensorPeriod = 5000; // ms waited before next loop

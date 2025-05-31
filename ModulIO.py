@@ -60,7 +60,7 @@ class Device:
             confirmed = conf_event.wait(timeout=2)
             errored = errr_event.is_set()
             if not confirmed or errored:
-                raise RuntimeError(f"Arduino did not confirm device {name} creation.")
+                raise RuntimeError(f"Device unconfirmed or errored.")
 
             self.name = name
             self.pin = pin_str
@@ -78,7 +78,7 @@ class Device:
         """Gets sensed or actuated value.
         
         Returns:
-            str | int: Sensors return their sensed value, while actuators return their current
+            str: Sensors return their sensed value, while actuators return their current
                 state.
         """
         with self.lock:
@@ -114,7 +114,7 @@ class Device:
         """Sets the self.value property of the device.
 
         Args:
-            value (str | int): The new value to update the device with. 
+            value (str): The new value to update the device with. 
         
         Notes:
             This function is typically called by the receive_data thread.
@@ -143,13 +143,16 @@ SERIAL_BAUD_RATE = 115200 # Baud rate for serial communication. Must match Ardui
 SERIAL_TIMEOUT = 100 # Timeout for serial communication in ms. Must match Arduino setting!
 ser = None # Connection instance
 
+IDLE_WAIT_DELAY = 0.002 # Short delay to avoid busy waiting
+DEFAULT_DATA_STREAM_PERIOD = 5000 # ms
+
 # Device setup
 MAX_DEVICES = 10  # Maximum devices that can be created
 device_dict = {} # Names to device instances
 names_in_order = [] # Names in order of indexes
 
 # Threading setup
-thread_receive_data = None # Thread for receiving data from Arduino
+thread_receive_serial = None # Thread for receiving data from Arduino
 stop_receive_event = threading.Event() # Tells receive data thread to stop
 thread_record_data = None # Thread for recording data to CSV
 stop_record_event = threading.Event() # Tells record data thread to stop
@@ -221,9 +224,12 @@ def disconnect() -> None:
     global ser
 
     # Remove all devices
-    for device in names_in_order[:]:  # Copy the list to avoid modifying it while iterating
-        device_dict[device].set_value(0)  # Turn off all devices before removing
-        remove_device(device)
+    for name in names_in_order[:]:  # Copy the list to avoid modifying it while iterating
+        device_dict[name].set_value(0)  # Turn off all devices before removing
+        remove_device(name)
+
+    # Set data stream back to default
+    change_data_stream_period(DEFAULT_DATA_STREAM_PERIOD)
 
     # Stop all running threads
     _stop_record_thread()
@@ -409,7 +415,7 @@ def _enable_data_stream() -> None:
     global data_stream_active
 
     _safe_write("t 1")
-    logging.info("Data stream activated'")
+    logging.info("Data stream activated")
     
 def _disable_data_stream() -> None:
     """Disables data stream from Arduino. 
@@ -453,74 +459,74 @@ def _update_data(datalist: list) -> None:
 ####################################################################################################
 # THREADING
 
-def _receive_data() -> None:
+def _receive_serial() -> None:
     """Handles incoming data from Arduino & calls required actions.
     """
-
     logging.info("Python can now receive data from Arduino")
 
     while not stop_receive_event.is_set():
 
-        if ser and ser.is_open and ser.in_waiting > 0:
+        if ser and ser.is_open:
+            if ser.in_waiting > 0:
 
-            try:
-                data = ser.readline().decode('ascii').strip()
-                if data:
-                    match data[0:5]:
-                        case "Conf:":
-                            logging.info("Arduino -> " + data)
-                            conf_event.set()
+                try:
+                    data = ser.readline().decode('ascii').strip()
+                    if data:
+                        match data[0:5]:
+                            case "Conf:":
+                                logging.info("Arduino -> " + data)
+                                conf_event.set()
 
-                        case "Data:":
-                            logging.debug("Arduino -> "+ data) # set under debug flag since this is spammy
-                            # Check for complete data
-                            assert data.endswith(";"), "Incomplete data (missing semicolon)"
-                            # Pass data to device instances
-                            _update_data(data[6:-1].split())
+                            case "Data:":
+                                logging.debug("Arduino -> "+ data) # set under debug flag since this is spammy
+                                # Check for complete data
+                                assert data.endswith(";"), "Incomplete data (missing semicolon)"
+                                # Pass data to device instances
+                                _update_data(data[6:-1].split())
 
-                        case "Errr:":
-                            logging.warning("Arduino -> " + data) # only warn since usually handled by Python
-                            errr_event.set()
+                            case "Errr:":
+                                logging.warning("Arduino -> " + data) # only warn since usually handled by Python
+                                errr_event.set()
 
-                        case "Recv:":
-                            logging.info("Arduino -> " + data) # For logging/debugging purposes only
+                            case "Recv:":
+                                logging.info("Arduino -> " + data) # For logging/debugging purposes only
 
-                        case _:
-                            logging.error("Received data not matched: " + data)
+                            case _:
+                                logging.error("Received data not matched: " + data)
 
-            except Exception as e:
-                logging.error(f"Error while receiving data: {e}")
-
-        time.sleep(0.002)  # Sleep for a short time to avoid busy waiting
+                except Exception as e:
+                    logging.error(f"Error while receiving data: {e}")
+        else:
+            time.sleep(IDLE_WAIT_DELAY)  # Sleep for a short time to avoid busy waiting
 
 def _start_receive_thread():
     """Starts a _receive_data thread.
     """
-    global thread_receive_data
+    global thread_receive_serial
 
     # Check if called when thread already exists
-    if thread_receive_data and thread_receive_data.is_alive():
+    if thread_receive_serial and thread_receive_serial.is_alive():
         logging.info("Stopping existing receive thread before starting a new one.")
         _stop_receive_thread() # Delete thread so it can be created again
 
     stop_receive_event.clear()
 
-    thread_receive_data = threading.Thread(target=_receive_data, daemon=True)
-    thread_receive_data.start()
+    thread_receive_serial = threading.Thread(target=_receive_serial, daemon=True)
+    thread_receive_serial.start()
 
 def _stop_receive_thread():
     """Stops current _receive_data thread if running.
     """
-    global thread_receive_data
+    global thread_receive_serial
 
     stop_receive_event.set()
 
-    if thread_receive_data and thread_receive_data.is_alive():
-        thread_receive_data.join(timeout=1)  # give it a second to clean up
+    if thread_receive_serial and thread_receive_serial.is_alive():
+        thread_receive_serial.join(timeout=1)  # give it a second to clean up
         logging.info("Receive thread stopped.")
     else:
         logging.info("Receive thread was not running or already stopped.")
-    thread_receive_data = None
+    thread_receive_serial = None
 
 def _record_data_to_csv(filename: str) -> None:
     """Records data stream to a timestamped CSV.
@@ -553,11 +559,10 @@ def _record_data_to_csv(filename: str) -> None:
                     writer.writerow(row_list)
                     new_data_to_record = False  # Reset the flag after writing
                 else:
-                    time.sleep(0.002) # Sleep for a short time to avoid busy waiting
+                    time.sleep(IDLE_WAIT_DELAY) # Sleep for a short time to avoid busy waiting
         
         except Exception as e:
             logging.error(f"Error while recording data: {e}")
-            raise
 
 def _start_record_thread(filename: str):
     """Starts a _record_data_to_csv thread and updates recording flag.

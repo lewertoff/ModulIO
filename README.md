@@ -36,6 +36,3 @@
   5) In create_device function, add your case with a corresponding letter
   6) Also in create_device, add your letter and device type to the type_map variable.
 
-
-
-
