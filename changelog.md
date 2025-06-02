@@ -1,24 +1,26 @@
 # CHANGELOG - in reverse chronological order
-## Future plans
+
+## Future Plans - Known Issues and Roadmap
 - Unit testing
+- Figure out why CSV file is empty  
+- Refine send/recv algorithm EVEN MORE using checksums
+- Figure out minimum time needed between set_value calls
+- Add a toggle for user-facing outgoing serial messages in Arduino 
 
-- COMPLETE rework of terminologies & documentation of .ino file - ex: sensor loop / serial spam / data stream, and multiple more inconsistencies in naming. Also, we should define those terms somewhere for documentation purposes.
-
-- add a delay between any messages sent out! Sending data over serial could benefit from running in its own thread. That would allow it to run asynchronously and we could tell it to wait a millisecond or so between lines. And other functions would send their data not by calling _safe_write() but by updating a queue that feeds into this thread. This setup should eliminate a lot of communication inefficiency.
-
-- Right now baud rate is pretty high. Determine lowest working baud rate & document minimum advisable. Also, figure out why long messages (like "help" message from Arduino) do not show fully.
-- Timeout should be whatever time it takes for baud rate to transmit 512 characters plus a few ms. Busy idle wait time should be a fraction of timeout (maybe a quarter or half).
-
-- Figure out why Arduino keeps seeing blank messages.
-
-- See if there are any weaknesses in the code in how data reception & transmission works. Really, we are looking for examples of data that, if not communicated properly over serial (ex: bad connection or random dropout) will not be error-checked. Examle: device creation data being garbled when sent out, leading to Python having one extra device than the Arduino. In this example, the device errors if Arduino does not confirm. Implement more of this.
-
-- New lighter recording algorithm: if recording_active is true, take a copy of the "Data:" string from receive_data function, cut it into a list, and remove every first out of two columns. This will heavily reduve the number of ._get_data() calls, freeing up those functions for more external use.
-
-- Add toggle for logging data stream to not overload log file
+## v0.5 - 2025/06/02 6:38 PM
+- Refactored Arduino variable names for consistency
+- Heavily improved .ino file documentation
+- Heavy updates to README
+- Added info() function on Arduino
+- Created new, much lighter, queue-based recording algorithm
+- Revamped Python → Arduino serial communications for robustness
+- Removed redundant internal recording_active flag
+- In Arduino, invalid commands will no longer return error keyword, potentially interfering with other actions.
+- Introduced new "Warn:" keyword in Arduino communication.
+- Fixed threads not terminating properly on stop function calls
 
 ## v0.4.2 - 2025/05/31 4:35 PM
-- Preparations to implement most of the above ideas
+- Preparations to implement lots of new ideas
 - Data stream period is now reset to default on disconnect
 
 ## v0.4.1 Hotfix - 2025/05/29 10:40 PM
@@ -43,12 +45,12 @@
 - Removed unnecessary global initializations in Python
 - Disconnecting serial in Python will now stop recording
 - Memory allocation improvements for Arduino - now storing config variables in flash
-- Added logging for info & errors
+- Added logging for info and errors
 - Added docstrings to functions
 
 ## v0.2 - 2025/05/25 11:40 pm
-- Various bug & edge case fixes
-- Improved internal documentation & structure
+- Various bug and edge case fixes
+- Improved internal documentation and structure
 - Added safety measures to prevent different threads from writing to serial at once
 - Added promised ability to record data to CSV
 - Added ability to change data stream period separately & added minimum period of 1ms

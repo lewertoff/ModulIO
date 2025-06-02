@@ -1,7 +1,7 @@
 """
   ==================================================================================================
   ModulIO - A Python/Arduino program for managing devices over a serial connection.
-  Version 0.4.1 May 29 2025
+  Version 0.5 June 2 2025
   Description: Simplified universal control of GPIO devices through an Arduino host.
   ==================================================================================================
 
@@ -22,6 +22,7 @@ import threading
 import serial
 import csv
 import logging
+import queue
 
 class Device:
     def __init__ (self, char: str, name: str, pins: list[int]):
@@ -54,7 +55,7 @@ class Device:
             # Convert list of pins into string separating pins with spaces
             pin_str = " ".join(map(str, pins)) if isinstance(pins, list) else str(pins)
 
-            _safe_write(f"s {char} {name} {pin_str}")
+            _serial_write(f"s {char} {name} {pin_str}")
 
             # error check before confirming device
             confirmed = conf_event.wait(timeout=2)
@@ -96,7 +97,7 @@ class Device:
             once the data stream coming back from the Arduino confirms the new status. It is 
             updated via a call to the internal self._update function.
         """
-        _safe_write(f"c {self.index} {value}")
+        _serial_write(f"c {self.index} {value}")
 
     def get_index(self):
         """Gets the index of the device in the Arduino's devices array.
@@ -137,32 +138,44 @@ class Device:
         with self.lock:
             self.index = new_idx
 
-# Serial setup
-BOOTUP_DELAY = 2 # How long it takes for the microcontroller to begin loop() calls
+# MUST MATCH ARDUINO VALUES
 SERIAL_BAUD_RATE = 115200 # Baud rate for serial communication. Must match Arduino setting!
-SERIAL_TIMEOUT = 100 # Timeout for serial communication in ms. Must match Arduino setting!
-ser = None # Connection instance
+SERIAL_TIMEOUT = 60 # Timeout for serial communication in ms. Must match Arduino setting!
+MAX_DEVICES = 10  # Maximum devices that can be created. Must match Arduino setitng!
 
-IDLE_WAIT_DELAY = 0.002 # Short delay to avoid busy waiting
-DEFAULT_DATA_STREAM_PERIOD = 5000 # ms
+# Serial setup
+STARTUP_DELAY = 2 # How long it takes for the microcontroller to begin loop() calls
+ser = None # Connection instance
+serial_lock = threading.Lock() # For thread-safe serial communication
+
+# Sending setup
+send_queue = queue.Queue(maxsize = 100) # For sending messages out
+recv_queue = queue.Queue(maxsize = 1) # For comparing sent messages to Recv'd messages
+thread_send_serial = None # Thread for sending data to Arduino
+stop_send_event = threading.Event() # Tells send data thread to stop
+
+# Receiving setup
+thread_receive_serial = None # Thread for receiving data from Arduino
+stop_receive_event = threading.Event() # Tells receive data thread to stop
+
+# General setup
+IDLE_WAIT_DELAY = 0.015 # Short delay to avoid busy waiting
+conf_event = threading.Event() # Signifies general action confirmed
+errr_event = threading.Event() # Signifies general error
 
 # Device setup
-MAX_DEVICES = 10  # Maximum devices that can be created
 device_dict = {} # Names to device instances
 names_in_order = [] # Names in order of indexes
 
-# Threading setup
-thread_receive_serial = None # Thread for receiving data from Arduino
-stop_receive_event = threading.Event() # Tells receive data thread to stop
-thread_record_data = None # Thread for recording data to CSV
-stop_record_event = threading.Event() # Tells record data thread to stop
-conf_event = threading.Event() # Signifies general action confirmed
-errr_event = threading.Event() # Signifies general error
-serial_lock = threading.Lock() # For thread-safe serial communication
+# Data stream setup
+DEFAULT_DATA_STREAM_PERIOD = 5000 # ms, must match Arduino dataStreamPeriod value.
+data_stream_period = None # ms
+data_stream_active = False # Status variable
 
 # Recording setup
-recording = False # Status flag for recording data to CSV
-new_data_to_record = threading.Event() # Alerts recording threat of new data
+thread_record_data = None # Thread for recording data to CSV
+stop_record_event = threading.Event() # Tells record data thread to stop
+recording_queue = queue.Queue()
 
 # Logging setup
 logging.basicConfig(level=logging.DEBUG, format="%(asctime)s [%(levelname)s] - %(message)s", 
@@ -188,10 +201,15 @@ class DCMotorDevice(Device):
         super().__init__("m", name, pin)
 
 ####################################################################################################
-# CALLABLE FUNCTIONS
+# FUNCTIONS
 
 def connect(port: str) -> None:
-    """Initializes serial connection, then starts data stream and reception.
+    """Initializes serial connection.
+    On connection, the following is started:
+    - Serial receive thread
+    - Serial send thread
+    - Serial data stream (starts at default rate)
+    All of these are meant to run until disconnect() is called.
     
     Args:
         port (str): The serial port to connect to (e.g., "COM5").
@@ -202,11 +220,12 @@ def connect(port: str) -> None:
         ser = serial.Serial(port, SERIAL_BAUD_RATE, timeout=SERIAL_TIMEOUT)
         logging.info(f"Connected to {port}.")
         
-        time.sleep(BOOTUP_DELAY) # IMPORTANT! Wait for Arduino to reboot (it automatically resets when serial port is opened)
+        time.sleep(STARTUP_DELAY) # IMPORTANT! Wait for Arduino to reboot (it automatically resets when serial port is opened)
         
         ser.reset_input_buffer() # Empty input buffer to avoid reading startup junk
 
-        _start_receive_thread() # Start thread to read messages from Arduino
+        _start_send_thread()
+        _start_receive_thread()
 
         _enable_data_stream() # Tell Arduino to start sending data
 
@@ -223,21 +242,25 @@ def disconnect() -> None:
     """
     global ser
 
+    # Stop recording
+    if thread_record_data:
+        _stop_record_thread()
+
+    # Set data stream back to default
+    change_data_stream_period(DEFAULT_DATA_STREAM_PERIOD)
+
+    # Tell Arduino to stop sending data
+    _disable_data_stream() 
+
     # Remove all devices
     for name in names_in_order[:]:  # Copy the list to avoid modifying it while iterating
         device_dict[name].set_value(0)  # Turn off all devices before removing
         remove_device(name)
 
-    # Set data stream back to default
-    change_data_stream_period(DEFAULT_DATA_STREAM_PERIOD)
-
     # Stop all running threads
-    _stop_record_thread()
-    time.sleep(0.1) # Give some time for the thread to stop
     _stop_receive_thread()
-
-    _disable_data_stream() # Tell Arduino to stop sending data
-
+    _stop_send_thread()
+    
     if ser and ser.is_open:
         ser.close()
         logging.info("Serial disconnected.")
@@ -263,19 +286,19 @@ def create_device(device_char: str, name: str, pins: list[int]) -> Device | None
     global device_dict
 
     # Recording check
-    if recording:
+    if thread_record_data:
         logging.warning("Cannot create a device while recording.")
-        raise Exception("Cannot create a device while recording. Please stop recording first.")
+        raise RuntimeError("Cannot create a device while recording. Please stop recording first.")
     
     # Name check
     if name in device_dict:
         logging.warning(f"Device '{name}' already exists.")
-        raise Exception(f"Device '{name}' already exists. Please choose a different name.")
+        raise ValueError(f"Device '{name}' already exists. Please choose a different name.")
     
     # Device number check
     if len(names_in_order) >= MAX_DEVICES:
         logging.error(f"Maximum number of devices reached.")
-        raise Exception(f"Maximum number of devices ({MAX_DEVICES}) reached. Cannot add more devices.")
+        raise RuntimeError(f"Maximum number of devices ({MAX_DEVICES}) reached. Cannot add more devices.")
 
     match device_char:
         case 'b':
@@ -317,7 +340,7 @@ def remove_device(name: str) -> None:
     global device_dict, names_in_order
 
     # Recording check
-    if recording:
+    if thread_record_data:
         logging.warning("Cannot delete a device while recording.")
         raise RuntimeError("Cannot detete a device while recording. Please stop recording first.")
 
@@ -329,7 +352,7 @@ def remove_device(name: str) -> None:
 
         try:
             # Delete device from Arduino
-            _safe_write(f"r {idx}")
+            _serial_write(f"r {idx}")
 
             # Error check to see if it was actually deleted
             confirmed = conf_event.wait(timeout=2)
@@ -365,11 +388,14 @@ def change_data_stream_period(delay: int) -> None:
     Notes:
         Arduino's default is 5000ms to not overload I/O. It is advised to set your own value.
     """
+    global data_stream_period
+
     if not isinstance(delay, int) or delay < 1:
         logging.error("Tried to set an invalid data stream delay.")
         raise Exception("Delay must be an integer above 0.")
     
-    _safe_write(f"u {delay}")
+    _serial_write(f"u {delay}")
+    data_stream_period = delay
     logging.info(f"Data stream delay set to {delay} ms.")
 
 def start_recording(filename:str) -> None:
@@ -394,8 +420,8 @@ def stop_recording() -> None:
     """
     _stop_record_thread()
 
-def _safe_write(msg: str) -> None:
-    """Safely transmits string through serial.
+def _serial_write(msg: str) -> None:
+    """Adds message to serial output queue.
 
     Args:
         msg (str): String to transmit.
@@ -403,18 +429,19 @@ def _safe_write(msg: str) -> None:
     Notes:
         Thread-safe. Use for all transmissions.
     """
-    if ser and ser.is_open:
-        with serial_lock:
-            ser.write(f"{msg}\n\r".encode('ascii'))
-            ser.flush()  # Ensure the message is sent immediately
-        logging.info(f"Python -> Sent: {msg}")
+    if send_queue.full():
+        logging.critical("Send queue is full.")
+        raise RuntimeError("Send queue is full.")
+    else:
+        send_queue.put(msg)
+        logging.debug(f"added \"{msg}\" to send queue")
 
 def _enable_data_stream() -> None:
     """Enable data stream from Arduino.
     """
     global data_stream_active
 
-    _safe_write("t 1")
+    _serial_write("t 1")
     logging.info("Data stream activated")
     
 def _disable_data_stream() -> None:
@@ -422,11 +449,11 @@ def _disable_data_stream() -> None:
     """
     global data_stream_active
 
-    _safe_write("t 0")
+    _serial_write("t 0")
     logging.info("Data stream deactivated'")
 
 def _update_data(datalist: list) -> None:
-    """Updates values of all connected devices with new readings.
+    """Updates values of all connected devices with new readings. Also updates recording queue if recording.
 
     Args:
         datalist (list): List of new data organized as [name:str, value, name2:str, value2, ...]
@@ -439,6 +466,11 @@ def _update_data(datalist: list) -> None:
     # Ensure device-value pairs are complete
     if len(datalist) % 2 == 0 and len(datalist) / 2 == len(names_in_order): 
 
+        # If recording is active, send list to queue
+        if thread_record_data:
+            recording_queue.put([datetime.now().strftime("%H:%M:%S.%f")[:-3]] + datalist[1::2])
+
+        # Update device values
         while datalist:
             key = datalist.pop(0) # Pop first index, which is the device name
             value = datalist.pop(0) # Pop first index again, which is now its value
@@ -447,10 +479,6 @@ def _update_data(datalist: list) -> None:
                 device_dict[key]._update(value)
             else:
                 logging.warning(f"{key} not found in device_dict")
-        
-        # If recording is active, set the flag to record new data
-        if recording:
-            new_data_to_record = True
 
     else:
         logging.warning("Received data list is not complete or does not match device count.")
@@ -459,10 +487,11 @@ def _update_data(datalist: list) -> None:
 ####################################################################################################
 # THREADING
 
+# Receive_serial: Receives msgs & calls required actions.
 def _receive_serial() -> None:
     """Handles incoming data from Arduino & calls required actions.
     """
-    logging.info("Python can now receive data from Arduino")
+    logging.info("Serial receive thread now active!")
 
     while not stop_receive_event.is_set():
 
@@ -473,6 +502,7 @@ def _receive_serial() -> None:
                     data = ser.readline().decode('ascii').strip()
                     if data:
                         match data[0:5]:
+
                             case "Conf:":
                                 logging.info("Arduino -> " + data)
                                 conf_event.set()
@@ -488,8 +518,12 @@ def _receive_serial() -> None:
                                 logging.warning("Arduino -> " + data) # only warn since usually handled by Python
                                 errr_event.set()
 
+                            case "Warn:":
+                                logging.warning("Arduino -> " + data)
+
                             case "Recv:":
-                                logging.info("Arduino -> " + data) # For logging/debugging purposes only
+                                logging.info("Arduino -> " + data) 
+                                recv_queue.put(data[6:].split(";")[0])
 
                             case _:
                                 logging.error("Received data not matched: " + data)
@@ -499,7 +533,7 @@ def _receive_serial() -> None:
         else:
             time.sleep(IDLE_WAIT_DELAY)  # Sleep for a short time to avoid busy waiting
 
-def _start_receive_thread():
+def _start_receive_thread() -> None:
     """Starts a _receive_data thread.
     """
     global thread_receive_serial
@@ -514,7 +548,7 @@ def _start_receive_thread():
     thread_receive_serial = threading.Thread(target=_receive_serial, daemon=True)
     thread_receive_serial.start()
 
-def _stop_receive_thread():
+def _stop_receive_thread() -> None:
     """Stops current _receive_data thread if running.
     """
     global thread_receive_serial
@@ -523,13 +557,89 @@ def _stop_receive_thread():
 
     if thread_receive_serial and thread_receive_serial.is_alive():
         thread_receive_serial.join(timeout=1)  # give it a second to clean up
-        logging.info("Receive thread stopped.")
+        logging.info("Serial receive thread stopped.")
     else:
-        logging.info("Receive thread was not running or already stopped.")
+        logging.info("Serial receive thread was not running or already stopped.")
+
     thread_receive_serial = None
 
+# Send_serial: Sends msgs in send_queue & confirms that they were received.
+def _send_serial() -> None:
+    """Handles outgoing serial communications including data integrity checks & thread safety.
+    """
+    logging.info("Serial send thread now active!")
+
+    while not stop_send_event.is_set() or not send_queue.empty() and stop_send_event.is_set():
+        
+        # make sure recv queue is empty
+        if not recv_queue.empty():
+            logging.debug(recv_queue.get())
+        
+        # Get & write message
+        msg = send_queue.get()
+        with serial_lock:
+            ser.write(f"{msg}\n\r".encode('ascii'))
+            ser.flush() # Ensure the message is sent immediately
+        logging.info(f"Python -> Sent: {msg}")
+
+        # Make sure messgae was received properly
+        deadline = time.time() + SERIAL_TIMEOUT / 500
+        while True:
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                logging.warning(f"Message \"{msg}\" not confirmed from Arduino (timeout)")
+                recv_queue.put(msg)
+                break # Failure, try again later
+
+            try:
+                recv = recv_queue.get(timeout = SERIAL_TIMEOUT / 1000)             
+                if recv == msg: # Check if message was received as expected
+                    break # Success
+
+                else:
+                    logging.warning(f"Message \"{msg}\" not matched with received \"{recv}\"")
+
+            except queue.Empty: # Expected error, all good
+                continue # Wait until deadline
+        
+        # Warn if queue starts getting too long
+        if send_queue.qsize() > send_queue.maxsize * 0.95:
+            logging.warning("Send queue is over 95 percent full!")
+
+def _start_send_thread() -> None:
+    """Starts a _send_serial thread.
+    """
+    global thread_send_serial
+
+    # Check if called when thread already exists
+    if thread_send_serial and thread_send_serial.is_alive():
+        logging.info("Stopping existing sending thread before starting a new one.")
+        _stop_send_thread()
+    
+    # Clear stop event to ensure thread can start
+    stop_send_event.clear()
+
+    thread_send_serial = threading.Thread(target=_send_serial, daemon=True)
+    thread_send_serial.start()
+
+def _stop_send_thread() -> None:
+    """Stops current _send_serial thread if running.
+    """
+    global thread_send_serial
+
+    stop_send_event.set()
+
+    if thread_send_serial and thread_send_serial.is_alive():
+        thread_send_serial.join(timeout=1) # give it a second to clean up
+        logging.info("Sending thread stopped.")
+    else:
+        logging.info("Sending thread was not running or already stopped.")
+
+    thread_send_serial = None
+
+# Record_data_to_csv: Writes device data as it comes in to a CSV.
 def _record_data_to_csv(filename: str) -> None:
-    """Records data stream to a timestamped CSV.
+    """Records data stream w/ timestamp to a CSV file.
 
     Args:
         filename (str):Desired name of file to record to (e.g. "data.csv")
@@ -538,41 +648,40 @@ def _record_data_to_csv(filename: str) -> None:
         If a file of the same name already exists, it will be overwritten.
         While recording is enabled, new devices cannot be created.
     """
-    global new_data_to_record
+    try:
+        with open(filename, mode='w', newline='') as csvfile:
 
-    with open(filename, mode='w', newline='') as csvfile:
+            logging.info(f"Now recording to {filename}...")
 
-        logging.info(f"Python now recording to {filename}...")
+            writer = csv.writer(csvfile)
 
-        writer = csv.writer(csvfile)
+            fieldnames = ['Time'] + names_in_order # List for CSV header
+            writer.writerow(fieldnames)
 
-        fieldnames = ['Time'] + names_in_order # List for CSV header
-
-        writer.writerow(fieldnames)
-
-        try:
             while not stop_record_event.is_set():
-                if new_data_to_record:
-                    row_list = [datetime.now().strftime("%H:%M:%S.%f")[:-3]]
-                    for name in names_in_order:
-                        row_list.append(device_dict[name].get_value())
-                    writer.writerow(row_list)
-                    new_data_to_record = False  # Reset the flag after writing
-                else:
-                    time.sleep(IDLE_WAIT_DELAY) # Sleep for a short time to avoid busy waiting
-        
-        except Exception as e:
-            logging.error(f"Error while recording data: {e}")
+                try:
+                    row = (recording_queue.get(timeout=data_stream_period)) # wait for upto a cycle
+                    writer.writerow(row)
+                except queue.Empty: # Expected error, all good
+                    pass # no logic required
+            
+            # When stop flag is set, catch any leftover rows before terminating
+            logging.info("Recording stop signaled, emptying queue...")
+            while not recording_queue.empty():
+                writer.writerow(recording_queue.get())
 
-def _start_record_thread(filename: str):
+    except Exception as e:
+                logging.error(f"Error while recording data: {e}")
+
+def _start_record_thread(filename: str) -> None:
     """Starts a _record_data_to_csv thread and updates recording flag.
     """
-    global thread_record_data, recording
+    global thread_record_data
 
     # Check if called when thread already exists
     if thread_record_data and thread_record_data.is_alive():
-        logging.error("Cannot start recording: already recording data.")
-        raise Exception("Cannot start recording: already recording data. Please stop recording first.")
+        logging.info("Stopping existing record thread before starting a new one.")
+        _stop_record_thread()
 
     # Clear the stop event to ensure the thread can start
     stop_record_event.clear()
@@ -580,22 +689,17 @@ def _start_record_thread(filename: str):
     thread_record_data = threading.Thread(target=_record_data_to_csv, args=(filename,), daemon=True)
     thread_record_data.start()
 
-    recording = True
-
-def _stop_record_thread():
+def _stop_record_thread() -> None:
     """ Stops current _record_data_to_csv thread if running.
     """  
-    # Internal function to stop the thread that records data to a CSV file.
-
-    global recording, thread_record_data
+    global thread_record_data
 
     stop_record_event.set()
-
-    recording = False
 
     if thread_record_data and thread_record_data.is_alive():
         thread_record_data.join(timeout=1)  # give it a second to clean up
         logging.info("Recording stopped.")
     else:
         logging.info("Recording thread was not running or already stopped.")
+
     thread_record_data = None
