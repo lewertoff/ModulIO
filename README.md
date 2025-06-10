@@ -39,7 +39,7 @@ Thank you for checking out ModulIO! Suggestions and contributions are always wel
   import ModulIO                         # Required import
 
   connect("COM5")                        # Attempts to connect to port "COM5" and start comms
-  led = create_device("l", "LED1", 3)    # Creates LED device named "LED1" on pin 3
+  led = create_device("l", "LED1", [3])    # Creates LED device named "LED1" on pin 3
   led.set_value(255)                     # Sets LED to full brightness
 
   time.sleep(10)     
