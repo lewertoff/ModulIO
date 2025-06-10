@@ -1,13 +1,19 @@
 # CHANGELOG - in reverse chronological order
 
 ## Future Plans - Known Issues and Roadmap
-- Unit testing
-- Figure out why CSV file is empty  
-- Refine send/recv algorithm EVEN MORE using checksums
-- Figure out minimum time needed between set_value calls
-- Add a toggle for user-facing outgoing serial messages in Arduino 
+- Figure out exact minimum time needed between set_value calls
+- Add device support for rotary encoder knob. Use this addition to make a PDF guide on how to add your own custom modules. Also, show that a rotary encoder w/ click can be programmed as a button device plus an encoder device. Two outputs, two statuses, two devices.
 
-## v0.5 - 2025/06/02 6:38 PM
+## 2025/06/09 - Implement checksums, priority sending, userMode
+- Implemented CRC8 Checksums for commands sent from Python to Arduino
+- Added userMode toggle in Arduino file. userMode=false triggers more redundancy for automated high-speed operation.
+- Arduino will now set device value to 0 before removing. Since Python does the same, this was only an issue when in userMode.
+- Arduino will now reject serial commands if not enough arguments are present.
+- Added high-priority sending queue that skips normal queue and waits for confirmation of action from Arduino.
+- Reworded some logging messages to be more precise
+- More updates to README
+
+## 2025/06/02 - Rewrite recording system improve docs
 - Refactored Arduino variable names for consistency
 - Heavily improved .ino file documentation
 - Heavy updates to README
@@ -19,15 +25,10 @@
 - Introduced new "Warn:" keyword in Arduino communication.
 - Fixed threads not terminating properly on stop function calls
 
-## v0.4.2 - 2025/05/31 4:35 PM
+## 2025/05/31 - Refactor Python serial API
 - Preparations to implement lots of new ideas
 - Data stream period is now reset to default on disconnect
-
-## v0.4.1 Hotfix - 2025/05/29 10:40 PM
 - Renamed change_data_stream_delay function to change_data_stream_period
-- Fix several communication issues due to renamed functions
-
-## v0.4 - 2025/05/29 2:27 AM
 - Tweaked license
 - Heavily improved documentation of Python library
 - All devices will now be removed when disconnecting
@@ -36,7 +37,7 @@
 - Data stream will now automatically be enabled on connection.
 - Removed toggle_data_stream and split it into two internal functions.
 
-## v0.3 - 2025/05/26 11:15 PM
+## 2025/05/26 - Add logging, optimize Arduino RAM, improve docs
 - Fixed typos in readme
 - Record thread will now stop when disconnect() is called
 - Added global constants for serial port, baudrate, and timeout
@@ -48,12 +49,13 @@
 - Added logging for info and errors
 - Added docstrings to functions
 
-## v0.2 - 2025/05/25 11:40 pm
+## 2025/05/25 - Add CSV recording, safer serial comms
 - Various bug and edge case fixes
 - Improved internal documentation and structure
 - Added safety measures to prevent different threads from writing to serial at once
 - Added promised ability to record data to CSV
 - Added ability to change data stream period separately & added minimum period of 1ms
+- Tweak license wording
 
-## Initial commit - 2025/05/24
-
+## 2025/05/23 - Initial Commit
+- Hi

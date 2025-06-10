@@ -5,9 +5,11 @@
   Description: Simplified universal control of GPIO devices through an Arduino host.
   ==================================================================================================
 
-    This file includes callable functions to connect & disconnect serial, create & remove devices, 
-    toggle data stream, and record data stream to a CSV.
+    This file includes callable functions to connect & disconnect serial, create & remove devices,
+    record device data to a CSV, and more.
     Device instances can also be read and written to, allowing for interaction with the devices.
+
+    https://github.com/lewertoff/ModulIO
 
     See README for information on how to add your own customizable devices.
 
@@ -20,6 +22,7 @@ import time
 from datetime import datetime
 import threading
 import serial
+import crcmod
 import csv
 import logging
 import queue
@@ -42,9 +45,6 @@ class Device:
         """
         global names_in_order
 
-        conf_event.clear()
-        errr_event.clear()
-
         self.value = None
         self.index = None
         self.name = None
@@ -55,13 +55,7 @@ class Device:
             # Convert list of pins into string separating pins with spaces
             pin_str = " ".join(map(str, pins)) if isinstance(pins, list) else str(pins)
 
-            _serial_write(f"s {char} {name} {pin_str}")
-
-            # error check before confirming device
-            confirmed = conf_event.wait(timeout=2)
-            errored = errr_event.is_set()
-            if not confirmed or errored:
-                raise RuntimeError(f"Device unconfirmed or errored.")
+            _serial_write(f"s {char} {name} {pin_str}", priority=True)
 
             self.name = name
             self.pin = pin_str
@@ -149,7 +143,11 @@ ser = None # Connection instance
 serial_lock = threading.Lock() # For thread-safe serial communication
 
 # Sending setup
+SENDING_DEADLINE = 1 # s, how long to wait for confirmation of sent messages
+PRIORITY_CONFIRM_TIMEOUT = 1 # s, how long to wait for confirmation of actions taken
+crc8 = crcmod.predefined.mkCrcFun('crc-8') # For msg checksums
 send_queue = queue.Queue(maxsize = 100) # For sending messages out
+priority_send_queue = queue.Queue(maxsize=10) # For high priority messages
 recv_queue = queue.Queue(maxsize = 1) # For comparing sent messages to Recv'd messages
 thread_send_serial = None # Thread for sending data to Arduino
 stop_send_event = threading.Event() # Tells send data thread to stop
@@ -161,7 +159,6 @@ stop_receive_event = threading.Event() # Tells receive data thread to stop
 # General setup
 IDLE_WAIT_DELAY = 0.015 # Short delay to avoid busy waiting
 conf_event = threading.Event() # Signifies general action confirmed
-errr_event = threading.Event() # Signifies general error
 
 # Device setup
 device_dict = {} # Names to device instances
@@ -188,7 +185,7 @@ class ButtonDevice(Device):
     def __init__ (self, name, pin):
         super().__init__("b", name, pin)
 
-class PressureSensorDevice(Device): # HX710B Pressure Sensor
+class PressureSensorDevice(Device): # HX710B Pressure Sensor. Values begin a few seconds after initialization.
     def __init__ (self, name, data, clk):
         super().__init__("p", name, [data, clk])
 
@@ -203,7 +200,7 @@ class DCMotorDevice(Device):
 ####################################################################################################
 # FUNCTIONS
 
-def connect(port: str) -> None:
+def connect(port: str) -> None: 
     """Initializes serial connection.
     On connection, the following is started:
     - Serial receive thread
@@ -216,6 +213,8 @@ def connect(port: str) -> None:
     """
     global ser
 
+    logging.info(f"Connecting to {port}...")
+
     try:
         ser = serial.Serial(port, SERIAL_BAUD_RATE, timeout=SERIAL_TIMEOUT)
         logging.info(f"Connected to {port}.")
@@ -227,6 +226,17 @@ def connect(port: str) -> None:
         _start_send_thread()
         _start_receive_thread()
 
+        # Tell Arduino to disable userMode & perform check
+        logging.info("Disabling userMode on Arduino...")
+        conf_event.clear()
+        with serial_lock:
+            ser.write("z 0".encode('ascii')) 
+        logging.debug("Python -> Sent: \"z 0\"")
+        confirmed = conf_event.wait(timeout=2)
+        if not confirmed:
+            logging.critical("Failed to confirm userMode disabled.")
+            raise RuntimeError("Failed to confirm userMode disabled. Check Arduino connection.")
+
         _enable_data_stream() # Tell Arduino to start sending data
 
     except Exception as e:
@@ -237,10 +247,12 @@ def disconnect() -> None:
     """Removes all devices and disconnects from the currently connected serial port.
 
     Notes:
-    Call this before terminating main program.
-    If recording is active, calling disconnect() will stop recording.
+        Call this before terminating main program.
+        If recording is active, calling disconnect() will stop recording.
     """
     global ser
+
+    logging.info("Disconnect() called. Cleaning up...")
 
     # Stop recording
     if thread_record_data:
@@ -254,8 +266,22 @@ def disconnect() -> None:
 
     # Remove all devices
     for name in names_in_order[:]:  # Copy the list to avoid modifying it while iterating
-        device_dict[name].set_value(0)  # Turn off all devices before removing
         remove_device(name)
+
+    # Set userMode back to True
+    logging.info("Re-enabling userMode on Arduino...")
+    _serial_write("z 1", priority=True)
+
+    # Wait for queues to finish sending (must do before closing threads)
+    while not priority_send_queue.empty():
+        time.sleep(IDLE_WAIT_DELAY)
+    # Wait for any remaining confirmation's deadline to pass
+    deadline = time.time() + PRIORITY_CONFIRM_TIMEOUT 
+    while not conf_event.is_set() and time.time() < deadline:
+        time.sleep(IDLE_WAIT_DELAY)
+    while not send_queue.empty(): # Wait for normal queue to be sent
+        time.sleep(IDLE_WAIT_DELAY)
+    time.sleep(0.1) # Add one more slight delay for safety margin
 
     # Stop all running threads
     _stop_receive_thread()
@@ -282,8 +308,13 @@ def create_device(device_char: str, name: str, pins: list[int]) -> Device | None
     Returns:
         Device: A new Device instance of the appropriate subclass.
         None: if an error occurred during creation.
+
+    Notes:
+        May cause logging warnings in the short time where device is created in Python but not yet in Arduino.
     """
     global device_dict
+
+    logging.info(f"Creating device '{name}'...")
 
     # Recording check
     if thread_record_data:
@@ -318,11 +349,11 @@ def create_device(device_char: str, name: str, pins: list[int]) -> Device | None
     if device: # If a device is created successfully
         device_dict[name] = device
 
-        logging.info(f"Added {type_map.get(device_char)} '{name}' on pin(s) {pins}.")
+        logging.info(f"Adding {type_map.get(device_char)} '{name}' on pin(s) {pins}.")
 
         return device
     else:
-        logging.warning(f"Failed to add {type_map.get(device_char)} '{name}'.")
+        logging.warning(f"Failed to create {type_map.get(device_char)} '{name}'.")
 
 def remove_device(name: str) -> None:
     """Deletes a device from the available devices.
@@ -336,8 +367,11 @@ def remove_device(name: str) -> None:
 
     Notes:
         Devices are removed from both Arduino and Python to keep parity.
+        May cause logging warnings in the short time where device is removed from Arduino but not yet from Python.
     """
     global device_dict, names_in_order
+
+    logging.info(f"Removing device '{name}'...")
 
     # Recording check
     if thread_record_data:
@@ -345,24 +379,14 @@ def remove_device(name: str) -> None:
         raise RuntimeError("Cannot detete a device while recording. Please stop recording first.")
 
     if name in device_dict:
-        conf_event.clear()
-        errr_event.clear()
-        
         idx = device_dict[name].get_index()
 
         try:
             # Delete device from Arduino
-            _serial_write(f"r {idx}")
-
-            # Error check to see if it was actually deleted
-            confirmed = conf_event.wait(timeout=2)
-            errored = errr_event.is_set()
-            if not confirmed or errored:
-                raise RuntimeError(f"Failed to remove device {name}.")
+            _serial_write(f"r {idx}", priority=True) # Arduino should know to turn off device first
             
             # Delete device from Python
             del device_dict[name]
-            logging.info(f"Removed device '{name}'.")
 
             # Remove the name at the device's index
             names_in_order.pop(idx)
@@ -390,13 +414,14 @@ def change_data_stream_period(delay: int) -> None:
     """
     global data_stream_period
 
+    logging.info(f"Changing data stream period to {delay} ms...")
+
     if not isinstance(delay, int) or delay < 1:
-        logging.error("Tried to set an invalid data stream delay.")
+        logging.error("Delay ms value invalid.")
         raise Exception("Delay must be an integer above 0.")
     
-    _serial_write(f"u {delay}")
+    _serial_write(f"u {delay}", priority=True)
     data_stream_period = delay
-    logging.info(f"Data stream delay set to {delay} ms.")
 
 def start_recording(filename:str) -> None:
     """Starts recording data to a CSV file.
@@ -420,37 +445,53 @@ def stop_recording() -> None:
     """
     _stop_record_thread()
 
-def _serial_write(msg: str) -> None:
+def _serial_write(cmd: str, priority=False) -> None:
     """Adds message to serial output queue.
 
     Args:
-        msg (str): String to transmit.
-
+        msg (str): String to transmit. Does not include checksum or CR/NL characters.
+        priority (bool): If True, message is sent using high priority queue with extra security checks.
+        
     Notes:
-        Thread-safe. Use for all transmissions.
+        High priofaster plus waits for confirmation from 
     """
-    if send_queue.full():
-        logging.critical("Send queue is full.")
-        raise RuntimeError("Send queue is full.")
+    cmd = cmd.strip()
+
+    if priority:
+        if priority_send_queue.full():
+            logging.critical("Priority send queue is full.")
+            raise RuntimeError("Priority send queue is full!")
+        else:
+            priority_send_queue.put(cmd)
+            logging.debug(f"added \"{cmd}\" to priority send queue")
+            return
     else:
-        send_queue.put(msg)
-        logging.debug(f"added \"{msg}\" to send queue")
+        if send_queue.full():
+            logging.critical("Send queue is full.")
+            raise RuntimeError("Send queue is full! Ensure enough delay is implemented between control_device calls!")
+        else:
+            send_queue.put(cmd)  
+            logging.debug(f"added \"{cmd}\" to send queue")
 
 def _enable_data_stream() -> None:
     """Enable data stream from Arduino.
     """
     global data_stream_active
 
-    _serial_write("t 1")
-    logging.info("Data stream activated")
+    logging.info("Activating data stream...")
+
+    _serial_write("t 1", priority=True) 
+    data_stream_active = True  # Update status variable
     
 def _disable_data_stream() -> None:
     """Disables data stream from Arduino. 
     """
     global data_stream_active
 
-    _serial_write("t 0")
-    logging.info("Data stream deactivated'")
+    logging.info("Deactivating data stream...")
+
+    _serial_write("t 0", priority=True)
+    data_stream_active = False  # Update status variable
 
 def _update_data(datalist: list) -> None:
     """Updates values of all connected devices with new readings. Also updates recording queue if recording.
@@ -516,7 +557,6 @@ def _receive_serial() -> None:
 
                             case "Errr:":
                                 logging.warning("Arduino -> " + data) # only warn since usually handled by Python
-                                errr_event.set()
 
                             case "Warn:":
                                 logging.warning("Arduino -> " + data)
@@ -526,10 +566,10 @@ def _receive_serial() -> None:
                                 recv_queue.put(data[6:].split(";")[0])
 
                             case _:
-                                logging.error("Received data not matched: " + data)
+                                logging.error("_receive_serial: Received data not matched: " + data)
 
                 except Exception as e:
-                    logging.error(f"Error while receiving data: {e}")
+                    logging.error(f"_receive_serial: Error while receiving data: {e}")
         else:
             time.sleep(IDLE_WAIT_DELAY)  # Sleep for a short time to avoid busy waiting
 
@@ -569,42 +609,80 @@ def _send_serial() -> None:
     """
     logging.info("Serial send thread now active!")
 
-    while not stop_send_event.is_set() or not send_queue.empty() and stop_send_event.is_set():
-        
-        # make sure recv queue is empty
+    while not stop_send_event.is_set() or (stop_send_event.is_set() and (not send_queue.empty() or not priority_send_queue.empty())):
+        # Ensure revc queue is empty
         if not recv_queue.empty():
-            logging.debug(recv_queue.get())
+            recv_queue.get()
         
-        # Get & write message
-        msg = send_queue.get()
+        priority = False # Default to normal priority
+        
+        # Get message (try to take from priority first)
+        try:
+            if not priority_send_queue.empty():
+                command = priority_send_queue.get_nowait()
+                priority = True
+                conf_event.clear()
+            elif not send_queue.empty():
+                command = send_queue.get_nowait()
+            else:
+                time.sleep(IDLE_WAIT_DELAY)
+                continue
+        except queue.Empty: # Expected error, all good
+            continue
+
+        # Build full message
+        checksum = crc8(command.encode("ascii")) # int
+        checksum_hex = f"{checksum:02X}"  # Format as 2-digit uppercase hex
+        msg = f"{checksum_hex}; {command}\r\n"
+
+        # Send message over serial
         with serial_lock:
-            ser.write(f"{msg}\n\r".encode('ascii'))
+            ser.write(msg.encode('ascii'))
             ser.flush() # Ensure the message is sent immediately
-        logging.info(f"Python -> Sent: {msg}")
+        logging.info(f"Python -> Sent: \"{msg[0:-2]}\"") # Exclude "\r\n" to avoid messy logs
 
         # Make sure messgae was received properly
-        deadline = time.time() + SERIAL_TIMEOUT / 500
-        while True:
+        deadline = time.time() + SENDING_DEADLINE
+        while True: # Time-critical While loop ∴ no idle wait delays!
             remaining = deadline - time.time()
+
             if remaining <= 0:
-                logging.warning(f"Message \"{msg}\" not confirmed from Arduino (timeout)")
-                recv_queue.put(msg)
+                logging.warning(f"_send_serial: Command \"{command}\" not confirmed from Arduino (timeout)")
+                
+                # Put message back in queue
+                if priority:
+                    priority_send_queue.put(command)
+                else:
+                    send_queue.put(command)
+
                 break # Failure, try again later
 
             try:
-                recv = recv_queue.get(timeout = SERIAL_TIMEOUT / 1000)             
-                if recv == msg: # Check if message was received as expected
+                # Parse received message for checksum
+                recv = recv_queue.get(timeout = SENDING_DEADLINE) 
+                arduino_checksum_hex = recv[0:2]
+                
+                # Check if message was received as expected
+                if checksum_hex == arduino_checksum_hex: 
                     break # Success
 
                 else:
-                    logging.warning(f"Message \"{msg}\" not matched with received \"{recv}\"")
+                    logging.warning(f"_send_serial: Transmitted checksum \"{checksum_hex}\" not matched with received \"{arduino_checksum_hex}\"")
 
             except queue.Empty: # Expected error, all good
                 continue # Wait until deadline
         
-        # Warn if queue starts getting too long
+        # If priority, check if command was confirmed
+        if priority:
+            confirmed = conf_event.wait(timeout=PRIORITY_CONFIRM_TIMEOUT)
+            if not confirmed:
+                logging.critical(f"_send_serial: Failed to confirm high-priority command \"{command}\".")
+            
+        # Check queue sizes
         if send_queue.qsize() > send_queue.maxsize * 0.95:
-            logging.warning("Send queue is over 95 percent full!")
+            logging.warning("_send_serial: Send queue is over 95 percent full!")
+        if priority_send_queue.qsize() > priority_send_queue.maxsize * 0.80:
+            logging.warning("_send_serial: Priority send queue is over 80 percent full!")
 
 def _start_send_thread() -> None:
     """Starts a _send_serial thread.
@@ -666,12 +744,12 @@ def _record_data_to_csv(filename: str) -> None:
                     pass # no logic required
             
             # When stop flag is set, catch any leftover rows before terminating
-            logging.info("Recording stop signaled, emptying queue...")
+            logging.info("_record_data_to_csv: Recording stop signaled, emptying queue...")
             while not recording_queue.empty():
                 writer.writerow(recording_queue.get())
 
     except Exception as e:
-                logging.error(f"Error while recording data: {e}")
+        logging.error(f"_record_data_to_csv: Error while recording data: {e}")
 
 def _start_record_thread(filename: str) -> None:
     """Starts a _record_data_to_csv thread and updates recording flag.

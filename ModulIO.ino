@@ -1,7 +1,7 @@
 /* 
   ==================================================================================================
   ModulIO - Modular GPIO controller
-  Version 0.5 June 2 2025
+  Version 1.0 June 9 2025
   Description: Runtime creation & control of I/O devices via serial commands
   ==================================================================================================
 
@@ -9,7 +9,9 @@
     command system via serial connection. 
     Its main purpose is to simplify GPIO device interactions such that all device interactions can 
     be generalized for easy management. Through serial interactions, devices can be controlled 
-    manually, or control can be automated by the ModulIO Python library. 
+    manually, or control can be automated by the ModulIO Python library.
+
+    https://github.com/lewertoff/ModulIO 
 
     See README for information on how to add your own customizable devices.
 
@@ -86,6 +88,9 @@ constexpr unsigned long serialBaudRate = 115200;
 constexpr unsigned int serialTimeout = 60; // ms
 constexpr unsigned int maxDevices = 10;
 
+// ModulIO Configuration
+bool userMode = true; // Who will be interacting with this program? true = user, False = Python script built with ModulIO.py.
+
 // Hardware setup
 constexpr int reservedPins[] = {0, 1}; // Tx and Rx
 constexpr int resPinSize = 2; // Number of reserved pins
@@ -101,8 +106,11 @@ String cmdarr[maxArgs];
 
 // Data stream setup
 unsigned long dataStreamPeriod = 5000; // ms waited before next loop
-bool dataStreamActive = false; // Controls continuous sensor data output via serial
+bool dataStreamEnable = false; // Controls continuous sensor data output via serial
 unsigned long msLastDataSent = 0; // ms
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+// HELPER FUNCTIONSs
 
 bool isInArray(int value, const int* arr, int size) {
     /**
@@ -120,6 +128,17 @@ bool isInArray(int value, const int* arr, int size) {
         }
     }
     return false;
+}
+
+uint8_t computeCRC8(const char *data, size_t length) {
+    uint8_t crc = 0x00;
+    while (length--) {
+        crc ^= *data++;
+        for (uint8_t i = 0; i < 8; i++) {
+            crc = (crc & 0x80) ? (crc << 1) ^ 0x07 : (crc << 1);
+        }
+    }
+    return crc;
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -417,7 +436,7 @@ void setup() {
     */
     Serial.begin(serialBaudRate);
     Serial.setTimeout(serialTimeout);
-    Serial.println(F("ModulIO v0.5 - Modular GPIO controller ready. Enter 'h' for help."));
+    Serial.println(F("ModulIO v1.0 - Modular GPIO controller ready. Enter 'h' for help."));
 }
 
 void loop() {
@@ -428,7 +447,7 @@ void loop() {
     }
 
     // Data stream - To report device data through serial
-    if (dataStreamActive) {
+    if (dataStreamEnable) {
         unsigned long msNow = millis();
 
         // If enough time has passed, send data out
@@ -446,6 +465,10 @@ void loop() {
             switch (cmdarr[0].charAt(0)) { // Switch based on first token
 
                 case 'c': // Control device
+                    if (arrlen < 3) {
+                        Serial.println(F("Warn: Not enough arguments for \"c\" command."));
+                        break;
+                    }
                     controlDevice(cmdarr[1].toInt(), cmdarr[2]);
                     break;
 
@@ -465,16 +488,32 @@ void loop() {
                     setupWiz(cmdarr);
                     break;
 
-                case 't': // Change data output
-                    dataStreamActive = bool(cmdarr[1].toInt());
+                case 't': // Data stream toggle
+                    if (arrlen < 2) {
+                            Serial.println(F("Warn: Not enough arguments for \"t\" command."));
+                            break;
+                    }   
+                    dataStreamSwitch(bool(cmdarr[1].toInt()));
                     break;
                 
                 case 'u': // Update data output period
-                    changedataStreamPeriod(cmdarr[1].toInt());
+                    if (arrlen < 2) {
+                            Serial.println(F("Warn: Not enough arguments for \"u\" command."));
+                            break;
+                    }
+                    changeDataStreamPeriod(cmdarr[1].toInt());
                     break;
 
                 case 'v': // View devices
                     viewDevices();
+                    break;
+
+                case 'z': // User mode toggle
+                    if (arrlen < 2) {
+                        Serial.println(F("Warn: Not enough arguments for \"z\" command."));
+                        break;
+                    }
+                    userModeSwitch(bool(cmdarr[1].toInt()));
                     break;
 
                 default:
@@ -488,11 +527,11 @@ void loop() {
 
 int getCmd(String out[]) {
     /**
-    * Fills command array (cmdarr) while counting tokens. Sends receival message of command back through serial.
-    * @brief Parses incoming serial commands into tokens.
+    * Fills command array (cmdarr) while counting tokens. If Python sent command, verifies checksum & rejects command if bad.
+    * @brief Parses incoming serial commands into tokens while verifying data integrity.
     *
-    * @param out[] The array to fill with tokens.
-    * @return The number of tokens in the array.
+    * @param out[] The global array to fill with tokens.
+    * @return The number of tokens in the array, or 0 if data verification failed.
     * @note This function assumes serial.available() is true when called.
     * @note If more than [maxArgs] tokens are received, the last index in the array receives the unparsed portion of the command.
     */
@@ -502,24 +541,52 @@ int getCmd(String out[]) {
         out[i] = "";
     }
 
-    String command = Serial.readStringUntil('\n');
-    command.trim(); // Remove leading or trailing whitespace
+    String msg = Serial.readStringUntil('\n');
+    msg.trim(); // Remove leading or trailing whitespace
 
-    Serial.print("Recv:");
+    if (!userMode) { // If Python is sending command
+
+        // Character length check
+        if (msg.length() > 128) {
+            Serial.println("Recv: <too long>; BAD");
+            return 0;
+        }
+
+        // Ensure msg is properly formatted
+        int sepIndex = msg.indexOf(';');
+        if (sepIndex == -1) { // If no seperator was found
+            Serial.println("Recv: <no seperator>; BAD");
+            return 0;
+        }
+
+        // Separate Python checksum from command
+        String checksumStr = msg.substring(0, sepIndex);
+        msg = msg.substring(sepIndex + 1);
+        msg.trim();
+
+        // Compute & compare checksums
+        uint8_t receivedCRC = strtoul(checksumStr.c_str(), nullptr, 16); // Parse hex
+        uint8_t computedCRC = computeCRC8(msg.c_str(), msg.length());
+
+        if (computedCRC != receivedCRC) { // If no match, send fail message & disregard command
+            Serial.println("Recv: " + String(computedCRC) + "; BAD");
+            return 0; 
+        } 
+
+        // If CRCs match, confirm & continue parsing msg
+        Serial.println("Recv: " + checksumStr + "; OK");
+    }
 
     // Parse command into tokens based on spaces
     int i = 0;
-    while (command.indexOf(' ') != -1 && i < maxArgs - 1) {
-        int idx = command.indexOf(' '); // Position of next space
-        out[i] = command.substring(0, idx);
-        command = command.substring(idx + 1);
+    while (msg.indexOf(' ') != -1 && i < maxArgs - 1) {
 
-        Serial.print(" " + out[i++]); // Print out token and increase i
+        int idx = msg.indexOf(' '); // Position of next space
+
+        out[i++] = msg.substring(0, idx);
+        msg = msg.substring(idx + 1);
     }
-    out[i] = command; // Store last token or remaining unparsed command
-
-    Serial.println(" " + command + "; length " + String(i + 1)); // Print out last token & length
-
+    out[i] = msg; // Store last token or remaining unparsed command
     return i + 1; // Return array length
 }
 
@@ -609,6 +676,9 @@ void removeDevice(int index) {
         return;
     }
 
+    // Ensure device is turned off before deleting it
+    devices[index]->write("0"); 
+
     // for confirmation purposes after deletion
     String name = devices[index]->name;
     String type = devices[index]->type;
@@ -657,9 +727,20 @@ void sendData() {
     Serial.println(out + ";"); // semi-colon to indicate end of data
 }
 
-void changedataStreamPeriod(int newPeriod) {
+void dataStreamSwitch(bool enable) {
     /**
-    * Changes the period of sensor data output.
+    * Enables or disables the serial data stream. Confirms the change via serial.
+    *
+    * @param enable true to enable, false to disable.
+    */
+    dataStreamEnable = enable;
+    if (enable) Serial.println(F("Conf: Data stream enabled."));
+    else Serial.println(F("Conf: Data stream disabled."));
+}
+
+void changeDataStreamPeriod(int newPeriod) {
+    /**
+    * Changes the period of sensor data output. Confirms the change via serial.
     *
     * @param newPeriod The new data stream period in ms.
     */
@@ -672,35 +753,56 @@ void changedataStreamPeriod(int newPeriod) {
     }
 }
 
+void userModeSwitch(bool enable) {
+    /**
+    * Enables or disables user mode. Confirms the change via serial.
+    *
+    * @param enable true to enable, false to disable.
+    * @note User mode is intended for human interaction with the program, via serial commands.
+    *       When disabled, the program assumes it is being controlled by the ModulIO Python library.
+    */
+    
+    userMode = enable;
+    if (enable) Serial.println(F("Conf: userMode enabled."));
+    else Serial.println(F("Conf: userMode disabled."));
+}
+
 void help() {
     /** 
     * Displays available commands & syntaxes for user guidance.
     */
 
-    Serial.println(F("====AVAILABLE FUNCTIONS===="));
-    Serial.println(F("h - Help"));
-    Serial.println(F("i - Info"));
-    Serial.println(F("s - Set up device"));
-    Serial.println(F("\tb - Button (s b [name] [pin])"));
-    Serial.println(F("\tl - LED (s l [name] [pin]) - positive pin"));
-    Serial.println(F("\tm - DC motor (s m [name] [pin])"));
-    Serial.println(F("\tp - Pressure sensor (s p [name] [data pin] [clock pin])"));
-    Serial.println(F("t - Enable or disable serial data stream (t [0 or 1])"));
-    Serial.println(F("u - Change data output period (u [period])"));
-    Serial.println(F("\t   (Default: 100 ms, no lower than 1 accepted)"));
-    Serial.println(F("v - View devices & their indexes"));
-    Serial.println(F("r - Remove device (r [index])"));
-    Serial.println(F("c - Control device (c [index] [new value])"));
+    if (userMode) {
+        Serial.println(F("====AVAILABLE FUNCTIONS===="));
+        Serial.println(F("h - Help"));
+        Serial.println(F("i - Info"));
+        Serial.println();
+        Serial.println(F("c - Control device (c [index] [new value])"));
+        Serial.println(F("r - Remove device (r [index])"));
+        Serial.println(F("s - Set up device"));
+        Serial.println(F("\tb - Button (s b [name] [pin])"));
+        Serial.println(F("\tl - LED (s l [name] [pin]) - positive pin"));
+        Serial.println(F("\tm - DC motor (s m [name] [pin])"));
+        Serial.println(F("\tp - Pressure sensor (s p [name] [data pin] [clock pin])"));
+        Serial.println(F("v - View devices & their indexes"));
+        Serial.println();
+        Serial.println(F("t - Enable or disable serial data stream (t [0 or 1])"));
+        Serial.println(F("u - Change data output period (u [ms period])"));
+        Serial.println(F("\t   (Default: 5000 ms, no lower than 1 accepted)"));
+        Serial.println(F("z - Toggle user mode (z [0 or 1])"));
+        Serial.println(F("\t   (Only intended to be used by Python script. Don't touch unless you know what you're doing)"));
+    }
 }
 
 void info() {
     /** 
     Displays program title, brief description, version, & repo link.
     */
-
-    Serial.println(F("====ModulIO - Version 0.5===="));
-    Serial.println(F("Simplified control of GPIO devices via serial commands"));
-    Serial.println(F("Get the associated Python library!:"));
-    Serial.println(F("https://github.com/lewertoff/ModulIO"));
-    Serial.println(F("More info available in README.md"));
+        if (userMode) {
+        Serial.println(F("====ModulIO - Version 1.0===="));
+        Serial.println(F("Simplified control of GPIO devices via serial commands"));
+        Serial.println(F("Get the associated Python library!:"));
+        Serial.println(F("https://github.com/lewertoff/ModulIO"));
+        Serial.println(F("More info available in README.md"));
+    }
 }
